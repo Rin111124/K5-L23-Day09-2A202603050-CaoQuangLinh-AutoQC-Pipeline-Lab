@@ -30,15 +30,110 @@ Chi tiết các ca biên (test kiểm đúng các ca này)
 Lưu ý số dòng: dùng `ds.read_label_lines(stem)` (giữ số dòng gốc, kể cả dòng hỏng/trống) để lấy `Issue.line`; `valid_boxes` KHÔNG giữ số dòng.
 
 Tất cả severity WARN; `Issue.extra` nên có {"conf": ...} hoặc {"iou": ...} (hàng đợi duyệt dùng conf để xếp ưu tiên).
-
-Gợi ý
-- `iou_xywh` có sẵn. Dòng nhãn hỏng không được làm script chết (dùng `ds.valid_boxes` và `parse_yolo_line` trong try).
-- Kết quả phụ thuộc mạnh vào ngưỡng: calibrate chúng ở Bước 3 thay vì đoán.
 """
-from ..common import WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
-from ..model_cache import get_preds  # noqa: F401
+from ..common import WARN, Issue, iou_xywh, parse_yolo_line
+from ..model_cache import get_preds
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+
+    so_cfg = cfg["second_opinion"]
+    conf_th = so_cfg["conf"]
+    min_area_px = so_cfg["min_area_px"]
+    fp_conf = so_cfg["fp_conf"]
+    iou_missing = so_cfg["iou_missing"]
+    iou_match = so_cfg["iou_match"]
+    iou_loose = so_cfg["iou_loose"]
+
+    issues = []
+
+    for img_p in ds.image_files():
+        stem = img_p.stem
+        if stem not in preds:
+            continue
+        if not ds.label_path(stem).exists():
+            continue
+
+        p_list = preds[stem]
+        raw_lines = ds.read_label_lines(stem)
+
+        valid_lines = []
+        if raw_lines:
+            for line_no, text in raw_lines:
+                try:
+                    c, cx, cy, w, h = parse_yolo_line(text)
+                except ValueError:
+                    continue
+                if 0 <= c < len(ds.classes):
+                    valid_lines.append((line_no, c, (cx, cy, w, h)))
+
+        labels_list = [(c, box) for _, c, box in valid_lines]
+
+        im_size = ds.image_size(stem)
+        W, H = im_size if im_size else (1, 1)
+
+        # 1. Filter predictions P (conf >= conf_th and area >= min_area_px)
+        P = []
+        for p in p_list:
+            c, conf, pcx, pcy, pw, ph = p
+            area = (pw * W) * (ph * H)
+            if conf >= conf_th and area >= min_area_px:
+                P.append(p)
+
+        # 2. Evaluate predictions in order
+        for p in P:
+            p_cls, p_conf, pcx, pcy, pw, ph = p
+            p_box = (pcx, pcy, pw, ph)
+
+            cands = []
+            for l_cls, l_box in labels_list:
+                iou = iou_xywh(p_box, l_box)
+                if iou >= iou_missing:
+                    cands.append((l_cls, l_box, iou))
+
+            if not cands:
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_MISSING", stem,
+                    f"model dự đoán {ds.classes[p_cls]} (conf={p_conf:.2f}) nhưng nhãn thiếu box",
+                    line=None, extra={"conf": p_conf, "cls": p_cls}
+                ))
+            else:
+                same_class_cands = [iou for l_cls, _, iou in cands if l_cls == p_cls]
+                if same_class_cands:
+                    best_same = max(same_class_cands)
+                    if best_same < iou_loose:
+                        issues.append(Issue(
+                            "second_opinion", WARN, "POSSIBLE_LOOSE_BOX", stem,
+                            f"nhãn {ds.classes[p_cls]} khớp vật nhưng box lỏng (IoU={best_same:.2f} < {iou_loose})",
+                            line=None, extra={"iou": best_same, "conf": p_conf}
+                        ))
+                    # else: covered correctly by same class label -> no issue
+                else:
+                    best_other = max(iou for _, _, iou in cands)
+                    if best_other >= iou_match:
+                        issues.append(Issue(
+                            "second_opinion", WARN, "POSSIBLE_WRONG_CLASS", stem,
+                            f"model dự đoán {ds.classes[p_cls]} (conf={p_conf:.2f}), nhãn gán khác lớp với IoU={best_other:.2f}",
+                            line=None, extra={"iou": best_other, "conf": p_conf}
+                        ))
+                    # else: ambiguous IoU in [iou_missing, iou_match) -> no issue
+
+        # 3. False Positive check for each valid label line
+        P_fp = [p for p in p_list if p[1] >= fp_conf]
+        for line_no, l_cls, l_box in valid_lines:
+            max_iou = 0.0
+            for p in P_fp:
+                p_box = (p[2], p[3], p[4], p[5])
+                iou = iou_xywh(l_box, p_box)
+                if iou > max_iou:
+                    max_iou = iou
+            if max_iou < iou_missing:
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_FALSE_POS", stem,
+                    f"dòng {line_no}: box nhãn không khớp dự đoán nào (max IoU={max_iou:.2f} < {iou_missing})",
+                    line=line_no, extra={"max_iou": max_iou}
+                ))
+
+    return issues
